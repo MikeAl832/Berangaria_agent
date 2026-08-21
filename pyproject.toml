@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "berangaria-agent"
+version = "0.1.0"
+description = "Background voice and screen agent for Berangaria"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "faster-whisper==1.2.1",
+  "httpx==0.28.1",
+  "mss==10.2.0",
+  "pillow==12.3.0",
+  "python-dotenv==1.2.2",
+  "pyyaml==6.0.3",
+  "sounddevice==0.5.6",
+  "vosk==0.3.45",
+  "webrtcvad-wheels==2.0.14",
+]
+
+[project.optional-dependencies]
+dev = [
+  "bandit==1.9.4",
+  "build==1.5.0",
+  "pytest==9.1.1",
+  "ruff==0.15.21",
+]
+
+[project.scripts]
+berangaria-agent = "berangaria_agent.__main__:main"
+
+[project.urls]
+Repository = "https://github.com/MikeAl832/Berangaria_agent"
+
+[tool.setuptools.package-data]
+berangaria_agent = ["static/*.html"]
+
+[tool.setuptools.packages.find]
+include = ["berangaria_agent*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

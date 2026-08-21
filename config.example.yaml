@@ -1,0 +1,66 @@
+# OpenRouter conversation and native vision
+model: "openai/gpt-5.6-luna"
+openrouter_url: "https://openrouter.ai/api/v1/chat/completions"
+openrouter_stt_url: "https://openrouter.ai/api/v1/audio/transcriptions"
+openrouter_referer: "https://github.com/MikeAl832/Berangaria_agent"
+openrouter_title: "Berangaria Desktop Agent"
+provider: "openai"                  # auto or an OpenRouter provider slug
+provider_allow_fallbacks: true
+service_tier: "priority"
+temperature: 0.8
+reply_tokens: 500
+history_turns: 12
+vision_detail: "original"
+reasoning_effort: "none"
+
+# Main speech-to-text path: local faster-whisper on NVIDIA GPU
+transcription_backend: "local"       # local or openrouter
+local_transcription_model: "large-v3-turbo"
+local_transcription_device: "cuda"   # use cpu with int8 on a machine without NVIDIA
+local_transcription_compute_type: "float16"
+local_transcription_beam_size: 3
+local_transcription_hotwords: ""      # wake-word bias causes hallucinations on silence
+local_transcription_wake_max_no_speech_prob: 0.35
+local_transcription_wake_min_avg_logprob: -1.30
+local_transcription_fallback_to_openrouter: true
+local_transcription_cuda_path: "runtime/cuda12"
+
+# OpenRouter STT is used by the diagnostic web UI and as a runtime fallback
+transcription_model: "openai/whisper-large-v3"
+transcription_provider: "groq"
+transcription_provider_allow_fallbacks: true
+transcription_timeout_seconds: 90
+transcription_language: "ru"
+transcription_temperature: 0
+transcription_normalize_audio: true
+transcription_max_seconds: 60
+
+# Fish Audio streaming speech
+fish_model: "s2.1-pro-free"
+fish_timeout_seconds: 45
+fish_emotion: "calm"
+fish_max_chars: 600
+fish_format: "wav"
+
+# Voice runtime. Empty microphone_device selects the Windows default input.
+microphone_device: ""
+wake_phrases: "бер,берр,бэр,берангария,вер"
+# Observed Whisper spellings; aliases activate only as the first word.
+wake_aliases: "берт,бэрт,бед,биар,биэр,бир,биан,биаф,br"
+wake_model_path: "models/vosk-model-small-ru-0.22"
+wake_followup_seconds: 8
+vad_aggressiveness: 3
+vad_silence_ms: 650
+vad_max_seconds: 20
+
+# Screen capture
+screen_monitor: 1
+screen_max_width: 1920
+screen_max_height: 1080
+screen_original_for_text_requests: true
+
+# Diagnostic loopback web UI
+port: 8765
+max_request_mb: 40
+max_audio_mb: 18
+max_screen_mb: 8

@@ -1,0 +1,70 @@
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from berangaria_agent.config import Settings
+
+
+@pytest.fixture
+def settings(tmp_path: Path) -> Settings:
+    return Settings(
+        project_root=tmp_path,
+        openrouter_api_key="openrouter-test",
+        openrouter_url="https://openrouter.test/chat",
+        openrouter_stt_url="https://openrouter.test/audio/transcriptions",
+        openrouter_referer="https://example.test",
+        openrouter_title="Agent Test",
+        model="test/model",
+        provider="auto",
+        provider_allow_fallbacks=True,
+        service_tier="priority",
+        temperature=0.7,
+        reply_tokens=321,
+        history_turns=2,
+        vision_detail="original",
+        reasoning_effort="low",
+        transcription_backend="local",
+        transcription_model="openai/whisper-large-v3",
+        transcription_provider="groq",
+        transcription_provider_allow_fallbacks=True,
+        transcription_timeout_seconds=10.0,
+        transcription_language="ru",
+        transcription_temperature=0.0,
+        transcription_normalize_audio=False,
+        transcription_max_seconds=60,
+        local_transcription_model="large-v3-turbo",
+        local_transcription_device="cuda",
+        local_transcription_compute_type="float16",
+        local_transcription_beam_size=3,
+        local_transcription_hotwords="Бер Берангария",
+        local_transcription_wake_max_no_speech_prob=0.35,
+        local_transcription_wake_min_avg_logprob=-1.30,
+        local_transcription_fallback_to_openrouter=True,
+        local_transcription_cuda_path="runtime/cuda12",
+        fish_api_key="fish-test",
+        fish_voice_id="voice-test",
+        fish_model="fish-test-model",
+        fish_timeout_seconds=10.0,
+        fish_emotion="calm",
+        fish_max_chars=600,
+        fish_format="wav",
+        microphone_device="Test Microphone",
+        wake_phrases=("бер", "берангария"),
+        wake_aliases=("берт", "биар", "br"),
+        wake_model_path="models/test-vosk",
+        wake_followup_seconds=8.0,
+        vad_aggressiveness=2,
+        vad_silence_ms=900,
+        vad_max_seconds=20,
+        screen_monitor=1,
+        screen_max_width=1920,
+        screen_max_height=1080,
+        screen_original_for_text_requests=True,
+        port=8765,
+        max_request_bytes=40 * 1024 * 1024,
+        max_audio_bytes=18 * 1024 * 1024,
+        max_screen_bytes=8 * 1024 * 1024,
+    )
