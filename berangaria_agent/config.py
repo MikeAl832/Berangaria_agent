@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import yaml
 from dotenv import load_dotenv
@@ -56,6 +57,21 @@ def _provider(value: object) -> str:
     if not re.fullmatch(r"[a-z0-9][a-z0-9._/-]{0,127}", provider):
         raise ValueError("provider должен быть 'auto' или корректным slug OpenRouter")
     return provider
+
+
+def _data_collection(value: object) -> str:
+    policy = _text(value, "deny").lower()
+    if policy not in {"allow", "deny"}:
+        raise ValueError("provider_data_collection должен быть allow или deny")
+    return policy
+
+
+def _https_url(value: object, default: str, *, field: str) -> str:
+    url = _text(value, default)
+    parsed = urlsplit(url)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+        raise ValueError(f"{field} должен быть HTTPS URL без встроенных учётных данных")
+    return url
 
 
 def _service_tier(value: object) -> str:
@@ -127,7 +143,10 @@ class Settings:
     model: str
     provider: str
     provider_allow_fallbacks: bool
+    provider_data_collection: str
+    provider_zdr: bool
     service_tier: str
+    chat_timeout_seconds: float
     temperature: float
     reply_tokens: int
     history_turns: int
@@ -155,6 +174,7 @@ class Settings:
     fish_voice_id: str
     fish_model: str
     fish_timeout_seconds: float
+    fish_first_audio_timeout_seconds: float
     fish_emotion: str
     fish_max_chars: int
     fish_format: str
@@ -170,6 +190,8 @@ class Settings:
     screen_max_width: int
     screen_max_height: int
     screen_original_for_text_requests: bool
+    turn_timeout_seconds: float
+    log_content: bool
     port: int
     max_request_bytes: int
     max_audio_bytes: int
@@ -179,10 +201,32 @@ class Settings:
     def fish_ready(self) -> bool:
         return bool(self.fish_api_key and self.fish_voice_id)
 
+    def provider_preferences(
+        self,
+        provider: str,
+        allow_fallbacks: bool,
+    ) -> dict[str, object]:
+        preferences: dict[str, object] = {
+            "allow_fallbacks": allow_fallbacks,
+            "data_collection": self.provider_data_collection,
+        }
+        if provider != "auto":
+            preferences["order"] = [provider]
+        if self.provider_zdr:
+            preferences["zdr"] = True
+        return preferences
+
     def validate_startup(self) -> None:
         if not self.openrouter_api_key:
             raise ValueError(
                 "OPENROUTER_API_KEY не задан. Скопируй .env.example в .env и заполни ключ."
+            )
+        if not self.wake_phrases:
+            raise ValueError("wake_phrases не должен быть пустым")
+        if self.transcription_backend == "local" and self.local_transcription_hotwords:
+            raise ValueError(
+                "local_transcription_hotwords должен оставаться пустым: подсказка имени "
+                "провоцирует ложные wake-word"
             )
 
 
@@ -198,6 +242,22 @@ def load_settings(project_root: Path | None = None) -> Settings:
         raw = {}
     if not isinstance(raw, dict):
         raise ValueError("config.yaml должен содержать YAML mapping/object")
+    if any(not isinstance(key, str) for key in raw):
+        raise ValueError("Все ключи config.yaml должны быть строками")
+    excluded_fields = {
+        "project_root",
+        "openrouter_api_key",
+        "fish_api_key",
+        "fish_voice_id",
+        "max_request_bytes",
+        "max_audio_bytes",
+        "max_screen_bytes",
+    }
+    known_fields = {field.name for field in fields(Settings)} - excluded_fields
+    known_fields.update({"max_request_mb", "max_audio_mb", "max_screen_mb"})
+    unknown_fields = sorted(set(raw) - known_fields)
+    if unknown_fields:
+        raise ValueError(f"Неизвестные поля config.yaml: {', '.join(unknown_fields)}")
 
     max_request_mb = _as_int(raw.get("max_request_mb"), 40, minimum=1, maximum=200)
     max_audio_mb = _as_int(raw.get("max_audio_mb"), 18, minimum=1, maximum=100)
@@ -205,16 +265,18 @@ def load_settings(project_root: Path | None = None) -> Settings:
     return Settings(
         project_root=root,
         openrouter_api_key=_text(os.environ.get("OPENROUTER_API_KEY")),
-        openrouter_url=_text(
+        openrouter_url=_https_url(
             os.environ.get("OPENROUTER_URL"),
             _text(raw.get("openrouter_url"), "https://openrouter.ai/api/v1/chat/completions"),
+            field="openrouter_url",
         ),
-        openrouter_stt_url=_text(
+        openrouter_stt_url=_https_url(
             os.environ.get("OPENROUTER_STT_URL"),
             _text(
                 raw.get("openrouter_stt_url"),
                 "https://openrouter.ai/api/v1/audio/transcriptions",
             ),
+            field="openrouter_stt_url",
         ),
         openrouter_referer=_text(raw.get("openrouter_referer")),
         openrouter_title=_text(raw.get("openrouter_title"), "Berangaria Desktop Agent"),
@@ -222,14 +284,21 @@ def load_settings(project_root: Path | None = None) -> Settings:
             os.environ.get("OPENROUTER_MODEL"),
             _text(raw.get("model"), "openai/gpt-5.6-luna"),
         ),
-        provider=_provider(os.environ.get("OPENROUTER_PROVIDER", raw.get("provider", "auto"))),
+        provider=_provider(
+            os.environ.get("OPENROUTER_PROVIDER", raw.get("provider", "openai"))
+        ),
         provider_allow_fallbacks=_as_bool(raw.get("provider_allow_fallbacks"), True),
-        service_tier=_service_tier(raw.get("service_tier")),
+        provider_data_collection=_data_collection(raw.get("provider_data_collection")),
+        provider_zdr=_as_bool(raw.get("provider_zdr"), False),
+        service_tier=_service_tier(raw.get("service_tier", "priority")),
+        chat_timeout_seconds=_as_float(
+            raw.get("chat_timeout_seconds"), 60.0, minimum=5.0, maximum=180.0
+        ),
         temperature=_as_float(raw.get("temperature"), 0.8, minimum=0.0, maximum=2.0),
         reply_tokens=_as_int(raw.get("reply_tokens"), 500, minimum=32, maximum=4096),
         history_turns=_as_int(raw.get("history_turns"), 12, minimum=1, maximum=50),
         vision_detail=_vision_detail(raw.get("vision_detail")),
-        reasoning_effort=_reasoning_effort(raw.get("reasoning_effort")),
+        reasoning_effort=_reasoning_effort(raw.get("reasoning_effort", "none")),
         transcription_backend=_transcription_backend(raw.get("transcription_backend")),
         transcription_model=_text(raw.get("transcription_model"), "openai/whisper-large-v3"),
         transcription_provider=_provider(raw.get("transcription_provider", "auto")),
@@ -284,6 +353,12 @@ def load_settings(project_root: Path | None = None) -> Settings:
         fish_timeout_seconds=_as_float(
             raw.get("fish_timeout_seconds"), 45.0, minimum=5.0, maximum=180.0
         ),
+        fish_first_audio_timeout_seconds=_as_float(
+            raw.get("fish_first_audio_timeout_seconds"),
+            5.0,
+            minimum=1.0,
+            maximum=30.0,
+        ),
         fish_emotion=_text(raw.get("fish_emotion"), "calm"),
         fish_max_chars=_as_int(raw.get("fish_max_chars"), 600, minimum=40, maximum=2000),
         fish_format=_fish_format(raw.get("fish_format")),
@@ -318,6 +393,10 @@ def load_settings(project_root: Path | None = None) -> Settings:
         screen_original_for_text_requests=_as_bool(
             raw.get("screen_original_for_text_requests"), True
         ),
+        turn_timeout_seconds=_as_float(
+            raw.get("turn_timeout_seconds"), 45.0, minimum=10.0, maximum=180.0
+        ),
+        log_content=_as_bool(raw.get("log_content"), False),
         port=_as_int(raw.get("port"), 8765, minimum=0, maximum=65535),
         max_request_bytes=max_request_mb * 1024 * 1024,
         max_audio_bytes=max_audio_mb * 1024 * 1024,

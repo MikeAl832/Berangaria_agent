@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import logging
 import re
 import shutil
-from collections.abc import Mapping
+import wave
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 
 import httpx
 
@@ -57,9 +60,37 @@ def sanitize_transcript(text: str) -> str:
     return cleaned if re.search(r"[a-zа-яё0-9]", cleaned, re.IGNORECASE) else ""
 
 
+def _validate_wav_duration(audio: bytes, maximum_seconds: int) -> None:
+    try:
+        with wave.open(io.BytesIO(audio), "rb") as wav:
+            frame_rate = wav.getframerate()
+            if frame_rate <= 0:
+                raise TranscriptionError("WAV содержит некорректную частоту дискретизации")
+            duration = wav.getnframes() / frame_rate
+    except (EOFError, wave.Error) as exc:
+        raise TranscriptionError(f"Некорректный WAV: {exc}") from exc
+    if duration > maximum_seconds:
+        raise TranscriptionError(
+            f"Запись длиннее допустимых {maximum_seconds} секунд ({duration:.1f} с)"
+        )
+
+
+@asynccontextmanager
+async def _client_scope(
+    existing: httpx.AsyncClient | None,
+    timeout: float,
+) -> AsyncIterator[httpx.AsyncClient]:
+    if existing is not None:
+        yield existing
+        return
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        yield client
+
+
 class TranscriptionClient:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, client: httpx.AsyncClient | None = None) -> None:
         self.settings = settings
+        self._client = client
 
     async def _normalized_audio(self, audio: bytes, audio_format: str) -> tuple[bytes, str]:
         if not self.settings.transcription_normalize_audio or audio_format == "wav":
@@ -106,6 +137,8 @@ class TranscriptionClient:
         if audio_format is None:
             raise TranscriptionError(f"Неподдерживаемый формат аудио: {mime}")
         audio, audio_format = await self._normalized_audio(audio, audio_format)
+        if audio_format == "wav":
+            _validate_wav_duration(audio, self.settings.transcription_max_seconds)
         payload = {
             "model": self.settings.transcription_model,
             "input_audio": {
@@ -116,11 +149,10 @@ class TranscriptionClient:
         }
         if self.settings.transcription_language:
             payload["language"] = self.settings.transcription_language
-        if self.settings.transcription_provider != "auto":
-            payload["provider"] = {
-                "order": [self.settings.transcription_provider],
-                "allow_fallbacks": self.settings.transcription_provider_allow_fallbacks,
-            }
+        payload["provider"] = self.settings.provider_preferences(
+            self.settings.transcription_provider,
+            self.settings.transcription_provider_allow_fallbacks,
+        )
         headers = {
             "Authorization": f"Bearer {self.settings.openrouter_api_key}",
             "Content-Type": "application/json",
@@ -128,15 +160,19 @@ class TranscriptionClient:
         if self.settings.openrouter_referer:
             headers["HTTP-Referer"] = self.settings.openrouter_referer
         if self.settings.openrouter_title:
-            headers["X-Title"] = self.settings.openrouter_title
+            headers["X-OpenRouter-Title"] = self.settings.openrouter_title
         last_error = "неизвестная ошибка"
-        async with httpx.AsyncClient(timeout=self.settings.transcription_timeout_seconds) as client:
+        async with _client_scope(
+            self._client,
+            self.settings.transcription_timeout_seconds,
+        ) as client:
             for attempt in range(3):
                 try:
                     response = await client.post(
                         self.settings.openrouter_stt_url,
                         json=payload,
                         headers=headers,
+                        timeout=self.settings.transcription_timeout_seconds,
                     )
                 except httpx.RequestError as exc:
                     last_error = str(exc) or exc.__class__.__name__
@@ -156,8 +192,10 @@ class TranscriptionClient:
                 generation_id = response.headers.get("X-Generation-Id", "нет")
                 last_error = (
                     f"HTTP {response.status_code}, generation={generation_id}, "
-                    f"format={audio_format}, bytes={len(audio)}: {response.text[:200]}"
+                    f"format={audio_format}, bytes={len(audio)}"
                 )
+                if self.settings.log_content and response.text:
+                    last_error += f": {response.text[:200]}"
                 if response.status_code not in _RETRYABLE_STATUSES or attempt >= 2:
                     break
                 retry_after = response.headers.get("Retry-After")

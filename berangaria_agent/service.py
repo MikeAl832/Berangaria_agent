@@ -80,7 +80,7 @@ class AgentService:
             request.screen_mime,
         )
         if request.screen and not chat_result.screen_description:
-            warnings.append("Luna не вернула описание снимка")
+            warnings.append("Модель не вернула описание снимка")
 
         speech: bytes | None = None
         speech_mime: str | None = None

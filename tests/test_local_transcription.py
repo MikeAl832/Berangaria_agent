@@ -33,7 +33,7 @@ class _FakeModel:
         )
 
 
-def test_local_whisper_uses_russian_hotwords_and_sanitizes(settings):
+def test_local_whisper_keeps_hotwords_disabled_and_sanitizes(settings):
     client = LocalWhisperTranscriber(settings)
     model = _FakeModel([" Бер, привет. ", " Продолжение следует..."])
     client._model = model
@@ -42,7 +42,7 @@ def test_local_whisper_uses_russian_hotwords_and_sanitizes(settings):
 
     assert result == "Бер, привет."
     assert model.kwargs["language"] == "ru"
-    assert model.kwargs["hotwords"] == "Бер Берангария"
+    assert model.kwargs["hotwords"] is None
     assert model.kwargs["condition_on_previous_text"] is False
     assert model.kwargs["temperature"] == 0.0
 

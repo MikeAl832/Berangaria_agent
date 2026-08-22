@@ -37,7 +37,7 @@ if not exist "%AGENT_PYTHON%" (
     if errorlevel 1 goto :setup_error
 ) else (
     echo [1/3] Python environment found.
-    "%AGENT_PYTHON%" -c "import faster_whisper, httpx, dotenv, mss, PIL, sounddevice, webrtcvad, yaml" >nul 2>nul
+    "%AGENT_PYTHON%" -c "import faster_whisper, httpx, dotenv, mss, PIL, sounddevice, vosk, webrtcvad, yaml" >nul 2>nul
     if errorlevel 1 (
         echo [2/3] Repairing dependencies...
         call :install_requirements
@@ -95,6 +95,11 @@ where uv >nul 2>nul
 if not errorlevel 1 (
     uv pip install --python "%AGENT_PYTHON%" -r "%AGENT_REQUIREMENTS%"
 ) else (
+    "%AGENT_PYTHON%" -m pip --version >nul 2>nul
+    if errorlevel 1 (
+        "%AGENT_PYTHON%" -m ensurepip --upgrade
+        if errorlevel 1 exit /b 1
+    )
     "%AGENT_PYTHON%" -m pip install -r "%AGENT_REQUIREMENTS%"
 )
 exit /b %ERRORLEVEL%

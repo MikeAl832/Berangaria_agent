@@ -15,11 +15,14 @@ import wave
 import winsound
 import zipfile
 from collections import deque
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import TypeVar
 
+import httpx
 import mss
 import mss.tools
 import sounddevice as sd
@@ -27,18 +30,21 @@ import vosk
 import webrtcvad
 from PIL import Image, ImageFilter
 
+from berangaria_agent.chat import ChatError, ChatResult, Conversation
 from berangaria_agent.config import Settings
-from berangaria_agent.fish import PCM_SAMPLE_RATE, FishError
+from berangaria_agent.fish import PCM_SAMPLE_RATE, FishClient, FishError, speech_text
 from berangaria_agent.local_transcription import (
     LocalNoSpeechError,
     LocalTranscript,
     LocalTranscriptionError,
     LocalWhisperTranscriber,
 )
-from berangaria_agent.service import AgentService, InputError, TurnRequest
+from berangaria_agent.service import AgentService
 from berangaria_agent.transcription import TranscriptionClient, TranscriptionError
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 StatusCallback = Callable[[str, str], None]
 
@@ -49,6 +55,8 @@ _FRAME_MS = 30
 _FRAME_SAMPLES = _SAMPLE_RATE * _FRAME_MS // 1000
 _WAKE_MODEL_NAME = "vosk-model-small-ru-0.22"
 _WAKE_MODEL_URL = f"https://alphacephei.com/vosk/models/{_WAKE_MODEL_NAME}.zip"
+_WAKE_ARCHIVE_MAX_BYTES = 128 * 1024 * 1024
+_WAKE_EXTRACTED_MAX_BYTES = 512 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -56,6 +64,26 @@ class RecordedUtterance:
     wav: bytes
     duration_seconds: float
     trailing_silence_seconds: float
+
+
+@dataclass(frozen=True)
+class PCMPlaybackMetrics:
+    first_chunk_seconds: float
+    first_output_seconds: float
+
+
+@dataclass(frozen=True)
+class StreamedVoiceResult:
+    chat: ChatResult
+    playback: PCMPlaybackMetrics
+    model_first_text_seconds: float
+    speech_ready_seconds: float
+    model_total_seconds: float
+    tts_started_at: float
+
+
+class BackgroundStopped(RuntimeError):
+    """The GUI requested a prompt stop of the active voice turn."""
 
 
 def configure_background_logging(root: Path) -> Path:
@@ -126,13 +154,25 @@ def install_wake_model(settings: Settings) -> Path:
         temp_root = Path(temp)
         archive_path = temp_root / "model.zip"
         # The URL is a fixed official HTTPS asset, never user-controlled.
-        urllib.request.urlretrieve(  # nosec B310
+        with urllib.request.urlopen(  # nosec B310
             _WAKE_MODEL_URL,
-            archive_path,
-        )
+            timeout=30,
+        ) as response, archive_path.open("wb") as output:
+            declared_size = response.headers.get("Content-Length")
+            if declared_size and int(declared_size) > _WAKE_ARCHIVE_MAX_BYTES:
+                raise RuntimeError("Архив wake-word модели превышает безопасный размер")
+            downloaded = 0
+            while chunk := response.read(1024 * 1024):
+                downloaded += len(chunk)
+                if downloaded > _WAKE_ARCHIVE_MAX_BYTES:
+                    raise RuntimeError("Архив wake-word модели превышает безопасный размер")
+                output.write(chunk)
         extract_root = temp_root / "extracted"
         extract_root.mkdir()
         with zipfile.ZipFile(archive_path) as archive:
+            extracted_size = sum(member.file_size for member in archive.infolist())
+            if extracted_size > _WAKE_EXTRACTED_MAX_BYTES:
+                raise RuntimeError("Распакованная wake-word модель превышает безопасный размер")
             for member in archive.infolist():
                 target = (extract_root / member.filename).resolve()
                 if not target.is_relative_to(extract_root.resolve()):
@@ -264,7 +304,7 @@ class LocalWakeDetector:
                 recognizer.AcceptWaveform(chunk)
         result = json.loads(recognizer.FinalResult())
         text = result.get("text", "") if isinstance(result, dict) else ""
-        logger.debug("Vosk fallback распознал: %s", text)
+        logger.debug("Vosk fallback завершён: chars=%d", len(text) if isinstance(text, str) else 0)
         return isinstance(text, str) and self.matcher.extract_request(text) is not None
 
 
@@ -340,53 +380,30 @@ def capture_screen_png(
         return mss.tools.to_png(screenshot.rgb, screenshot.size)
 
 
-def play_wav(audio: bytes) -> None:
-    if not audio.startswith(b"RIFF"):
-        raise RuntimeError("Fish Audio вернул не WAV; проверь fish_format: wav")
-    try:
-        with wave.open(io.BytesIO(audio), "rb") as wav:
-            _play_pcm_wav(wav)
-    except (EOFError, wave.Error) as exc:
-        raise RuntimeError(f"Fish Audio вернул повреждённый WAV: {exc}") from exc
-
-
-def _play_pcm_wav(wav: wave.Wave_read) -> None:
-    if wav.getsampwidth() != 2 or wav.getcomptype() != "NONE":
-        raise RuntimeError("Для воспроизведения нужен несжатый PCM16 WAV")
-    channels = wav.getnchannels()
-    sample_rate = wav.getframerate()
-    if channels not in {1, 2} or sample_rate <= 0:
-        raise RuntimeError("Fish Audio вернул неподдерживаемые параметры WAV")
-    try:
-        with sd.RawOutputStream(
-            samplerate=sample_rate,
-            channels=channels,
-            dtype="int16",
-            latency="low",
-        ) as output:
-            while chunk := wav.readframes(4096):
-                output.write(chunk)
-    except sd.PortAudioError as exc:
-        raise RuntimeError(f"Windows не смог воспроизвести голос: {exc}") from exc
-
-
 async def play_pcm_stream(
     chunks: AsyncIterator[bytes],
     *,
     on_first_audio: Callable[[float], None] | None = None,
-) -> float:
-    """Play a Fish PCM stream and return seconds until its first audio bytes."""
+    first_chunk_timeout_seconds: float | None = None,
+) -> PCMPlaybackMetrics:
+    """Play a Fish PCM stream and report network and first-output timings."""
     started = time.monotonic()
     iterator = chunks.__aiter__()
     try:
-        first_chunk = await anext(iterator)
+        first_chunk = await asyncio.wait_for(
+            anext(iterator),
+            timeout=first_chunk_timeout_seconds,
+        )
+    except TimeoutError as exc:
+        raise RuntimeError(
+            f"Fish Audio не начал поток за {first_chunk_timeout_seconds:.1f} с"
+        ) from exc
     except StopAsyncIteration as exc:
         raise RuntimeError("Fish Audio вернул пустой PCM-поток") from exc
-    first_audio_seconds = time.monotonic() - started
-    if on_first_audio is not None:
-        on_first_audio(first_audio_seconds)
+    first_chunk_seconds = time.monotonic() - started
 
     pending = b""
+    first_output_seconds: float | None = None
     try:
         with sd.RawOutputStream(
             samplerate=PCM_SAMPLE_RATE,
@@ -400,17 +417,27 @@ async def play_pcm_stream(
                 if frame_bytes:
                     output.write(pending[:frame_bytes])
                     pending = pending[frame_bytes:]
+                    if first_output_seconds is None:
+                        first_output_seconds = time.monotonic() - started
+                        if on_first_audio is not None:
+                            on_first_audio(first_output_seconds)
             async for chunk in iterator:
                 pending += chunk
                 frame_bytes = len(pending) - len(pending) % 2
                 if frame_bytes:
                     output.write(pending[:frame_bytes])
                     pending = pending[frame_bytes:]
+                    if first_output_seconds is None:
+                        first_output_seconds = time.monotonic() - started
+                        if on_first_audio is not None:
+                            on_first_audio(first_output_seconds)
     except sd.PortAudioError as exc:
         raise RuntimeError(f"Windows не смог воспроизвести голос: {exc}") from exc
     if pending:
         raise RuntimeError("Fish Audio оборвал PCM-поток посреди аудиосэмпла")
-    return first_audio_seconds
+    if first_output_seconds is None:
+        raise RuntimeError("Fish Audio не передал полный PCM-сэмпл")
+    return PCMPlaybackMetrics(first_chunk_seconds, first_output_seconds)
 
 
 def _percentile(samples: deque[float], fraction: float) -> float:
@@ -424,6 +451,185 @@ def _publish(callback: StatusCallback | None, state: str, detail: str = "") -> N
         callback(state, detail)
 
 
+def _log_text(settings: Settings, label: str, value: str) -> None:
+    if settings.log_content:
+        logger.info("%s: %s", label, value)
+    else:
+        logger.info("%s: chars=%d", label, len(value))
+
+
+async def _await_or_stop(
+    awaitable: Awaitable[_T],
+    stop_event: threading.Event,
+    *,
+    timeout_seconds: float | None = None,
+) -> _T:
+    task = asyncio.ensure_future(awaitable)
+    started = time.monotonic()
+    while True:
+        remaining = None
+        if timeout_seconds is not None:
+            remaining = timeout_seconds - (time.monotonic() - started)
+            if remaining <= 0:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+                raise TimeoutError
+        done, _ = await asyncio.wait(
+            {task},
+            timeout=min(0.1, remaining) if remaining is not None else 0.1,
+        )
+        if task in done:
+            return await task
+        if stop_event.is_set():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+            raise BackgroundStopped
+
+
+async def _stream_voice_response(
+    conversation: Conversation,
+    fish: FishClient,
+    owner_message: str,
+    screen: bytes,
+    *,
+    model_timeout_seconds: float,
+    fish_first_audio_timeout_seconds: float,
+    status_callback: StatusCallback | None,
+) -> StreamedVoiceResult:
+    text_queue: asyncio.Queue[str | None] = asyncio.Queue()
+    first_text = asyncio.Event()
+    model_started = time.monotonic()
+    first_text_at = 0.0
+    model_finished_at = 0.0
+
+    def on_delta(delta: str) -> None:
+        nonlocal first_text_at
+        if not first_text.is_set():
+            first_text_at = time.monotonic()
+            first_text.set()
+        text_queue.put_nowait(delta)
+
+    async def produce_text() -> ChatResult:
+        nonlocal model_finished_at
+        try:
+            async with asyncio.timeout(model_timeout_seconds):
+                return await conversation.stream_reply(
+                    owner_message,
+                    screen,
+                    "image/png",
+                    on_delta=on_delta,
+                )
+        finally:
+            model_finished_at = time.monotonic()
+            text_queue.put_nowait(None)
+
+    chat_task = asyncio.create_task(produce_text())
+    first_text_wait = asyncio.create_task(first_text.wait())
+    try:
+        done, _ = await asyncio.wait(
+            {chat_task, first_text_wait},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if chat_task in done and not first_text.is_set():
+            await chat_task
+            raise ChatError("OpenRouter завершил поток без текста")
+        await first_text_wait
+
+        async def text_chunks() -> AsyncIterator[str]:
+            while True:
+                piece = await text_queue.get()
+                if piece is None:
+                    return
+                yield piece
+
+        async def spoken_segments(chunks: AsyncIterator[str]) -> AsyncIterator[str]:
+            buffer = ""
+            spoken_chars = 0
+
+            def bounded(segment: str) -> str:
+                remaining = fish.settings.fish_max_chars - spoken_chars
+                if fish.settings.fish_max_chars <= 0:
+                    remaining = len(segment)
+                if remaining <= 0:
+                    return ""
+                return speech_text(segment, emotion="", max_chars=remaining)
+
+            async for piece in chunks:
+                buffer += piece
+                while match := re.search(r"[.!?…](?:\s+|$)", buffer):
+                    end = match.end()
+                    segment = bounded(buffer[:end].strip())
+                    buffer = buffer[end:]
+                    if segment:
+                        spoken_chars += len(segment)
+                        yield segment
+                    if 0 < fish.settings.fish_max_chars <= spoken_chars:
+                        return
+                if len(buffer) >= 240:
+                    split_at = max(buffer.rfind(",", 0, 241), buffer.rfind(" ", 0, 241))
+                    split_at = split_at + 1 if split_at >= 80 else 240
+                    segment = bounded(buffer[:split_at].strip())
+                    buffer = buffer[split_at:]
+                    if segment:
+                        spoken_chars += len(segment)
+                        yield segment
+                    if 0 < fish.settings.fish_max_chars <= spoken_chars:
+                        return
+            segment = bounded(buffer.strip())
+            if segment:
+                yield segment
+
+        segments = spoken_segments(text_chunks())
+        try:
+            first_segment = await anext(segments)
+        except StopAsyncIteration:
+            await chat_task
+            raise ChatError("OpenRouter не вернул текст для озвучивания") from None
+
+        async def audio_chunks() -> AsyncIterator[bytes]:
+            async for chunk in fish.stream_pcm(first_segment):
+                yield chunk
+            async for segment in segments:
+                async for chunk in fish.stream_pcm(segment):
+                    yield chunk
+
+        _publish(status_callback, "speaking", "Модель отвечает потоком · Fish готовит фразу…")
+        tts_started_at = time.monotonic()
+        playback = await play_pcm_stream(
+            audio_chunks(),
+            first_chunk_timeout_seconds=fish_first_audio_timeout_seconds,
+            on_first_audio=lambda _delay: _publish(
+                status_callback,
+                "speaking",
+                "Говорю",
+            ),
+        )
+        chat_result = await chat_task
+        return StreamedVoiceResult(
+            chat=chat_result,
+            playback=playback,
+            model_first_text_seconds=first_text_at - model_started,
+            speech_ready_seconds=tts_started_at - model_started,
+            model_total_seconds=model_finished_at - model_started,
+            tts_started_at=tts_started_at,
+        )
+    finally:
+        if not first_text_wait.done():
+            first_text_wait.cancel()
+        if not chat_task.done():
+            chat_task.cancel()
+        await asyncio.gather(first_text_wait, chat_task, return_exceptions=True)
+
+
+async def _signal_turn_error() -> None:
+    try:
+        await asyncio.to_thread(winsound.MessageBeep, winsound.MB_ICONHAND)
+    except RuntimeError:
+        logger.debug("Windows не смог воспроизвести системный сигнал ошибки", exc_info=True)
+
+
 async def run_background(
     settings: Settings,
     *,
@@ -432,8 +638,6 @@ async def run_background(
 ) -> None:
     if not settings.fish_ready:
         raise ValueError("Для фонового голосового режима нужны FISH_API_KEY и FISH_VOICE_ID")
-    if settings.fish_format != "wav":
-        raise ValueError("Для фонового режима установи fish_format: wav")
 
     log_path = configure_background_logging(settings.project_root)
     device_id, device_name = resolve_microphone(settings.microphone_device)
@@ -445,7 +649,6 @@ async def run_background(
     )
     matcher = WakePhraseMatcher(settings.wake_phrases, settings.wake_aliases)
     wake_detector: LocalWakeDetector | None = None
-    remote_transcriber = TranscriptionClient(settings)
     local_transcriber: LocalWhisperTranscriber | None = None
     if settings.transcription_backend == "local":
         _publish(status_callback, "transcribing", "Загружаю local Whisper на GPU…")
@@ -461,7 +664,15 @@ async def run_background(
     if local_transcriber is None:
         _publish(status_callback, "activating", "Подготавливаю резервную модель вызова…")
         wake_detector = await asyncio.to_thread(prepare_wake_detector, settings)
-    service = AgentService(settings)
+    openrouter_http = httpx.AsyncClient(timeout=settings.chat_timeout_seconds)
+    fish_http = httpx.AsyncClient(timeout=settings.fish_timeout_seconds)
+    remote_transcriber = TranscriptionClient(settings, client=openrouter_http)
+    service = AgentService(
+        settings,
+        conversation=Conversation(settings, client=openrouter_http),
+        transcriber=remote_transcriber,
+        fish=FishClient(settings, client=fish_http),
+    )
     armed_until = 0.0
     stop = stop_event or threading.Event()
     first_voice_samples: deque[float] = deque(maxlen=50)
@@ -525,6 +736,8 @@ async def run_background(
                     f"Local STT: {exc}; переключаюсь на OpenRouter",
                 )
             stt_seconds = time.monotonic() - stt_started
+            if stop.is_set():
+                break
             if transcript:
                 wake_started = time.monotonic()
                 extracted_request = matcher.extract_request(transcript)
@@ -552,10 +765,10 @@ async def run_background(
                     and local_result is not None
                     and not local_result.reliable_as_wake_only(settings)
                 ):
-                    logger.info("Отброшено неуверенное одиночное wake-word: %s", transcript)
+                    _log_text(settings, "Отброшено неуверенное одиночное wake-word", transcript)
                     continue
                 if not locally_activated:
-                    logger.info("Пропущено без wake-word: %s", transcript)
+                    _log_text(settings, "Пропущено без wake-word", transcript)
                     continue
 
         if not transcript:
@@ -577,14 +790,20 @@ async def run_background(
             _publish(status_callback, "transcribing", "Распознаю через OpenRouter…")
             stt_started = time.monotonic()
             try:
-                transcript = await remote_transcriber.transcribe(utterance.wav, "audio/wav")
+                transcript = await _await_or_stop(
+                    remote_transcriber.transcribe(utterance.wav, "audio/wav"),
+                    stop,
+                )
+            except BackgroundStopped:
+                break
             except TranscriptionError as exc:
                 logger.warning("STT не распознал фразу: %s", exc)
                 _publish(status_callback, "warning", f"STT: {exc}")
+                await _signal_turn_error()
                 continue
             stt_seconds = time.monotonic() - stt_started
 
-        logger.info("Распознано: %s", transcript)
+        _log_text(settings, "Распознано", transcript)
         _publish(status_callback, "heard", transcript)
 
         if armed_until:
@@ -607,78 +826,107 @@ async def run_background(
                 settings.screen_original_for_text_requests
                 and needs_original_screen(request_text)
             )
+            screen_mode = "original" if original_screen else "resized"
             screen = await asyncio.to_thread(
                 capture_screen_png,
                 settings.screen_monitor,
                 None if original_screen else settings.screen_max_width,
                 None if original_screen else settings.screen_max_height,
             )
+            if len(screen) > settings.max_screen_bytes and original_screen:
+                logger.warning(
+                    "Исходный снимок превышает лимит; уменьшаю: bytes=%d limit=%d",
+                    len(screen),
+                    settings.max_screen_bytes,
+                )
+                screen = await asyncio.to_thread(
+                    capture_screen_png,
+                    settings.screen_monitor,
+                    settings.screen_max_width,
+                    settings.screen_max_height,
+                )
+                screen_mode = "resized-fallback"
+            if len(screen) > settings.max_screen_bytes:
+                raise RuntimeError(
+                    "Снимок экрана превышает max_screen_mb даже после уменьшения"
+                )
+            if stop.is_set():
+                raise BackgroundStopped
             screen_seconds = time.monotonic() - screen_started
             logger.info(
                 "Снимок экрана: mode=%s bytes=%d",
-                "original" if original_screen else "resized",
+                screen_mode,
                 len(screen),
             )
-            luna_started = time.monotonic()
-            result = await service.process(
-                TurnRequest(text=request_text, screen=screen, screen_mime="image/png"),
-                synthesize=False,
-            )
-            luna_seconds = time.monotonic() - luna_started
-        except (InputError, RuntimeError) as exc:
+            try:
+                streamed = await _await_or_stop(
+                    _stream_voice_response(
+                        service.conversation,
+                        service.fish,
+                        request_text,
+                        screen,
+                        model_timeout_seconds=settings.turn_timeout_seconds,
+                        fish_first_audio_timeout_seconds=(
+                            settings.fish_first_audio_timeout_seconds
+                        ),
+                        status_callback=status_callback,
+                    ),
+                    stop,
+                )
+            except TimeoutError as exc:
+                raise RuntimeError(
+                    f"Модель не завершила поток за {settings.turn_timeout_seconds:.0f} с"
+                ) from exc
+        except BackgroundStopped:
+            break
+        except (ChatError, FishError, RuntimeError) as exc:
             logger.exception("Не удалось обработать голосовой ход")
             print(f"Ошибка: {exc}")
             _publish(status_callback, "error", str(exc))
+            await _signal_turn_error()
             continue
 
-        logger.info("Ответ: %s", result.reply)
-        _publish(status_callback, "reply", result.reply)
-        for warning in result.warnings:
-            logger.warning("Ход завершён с предупреждением: %s", warning)
-            _publish(status_callback, "warning", warning)
-        _publish(status_callback, "speaking", "Fish готовит первые аудиоданные…")
-        tts_started = time.monotonic()
-        try:
-            first_audio_seconds = await play_pcm_stream(
-                service.fish.stream_pcm(result.reply),
-                on_first_audio=lambda delay: _publish(
-                    status_callback,
-                    "speaking",
-                    f"Говорю · Fish начал поток за {delay:.1f} с",
-                ),
-            )
-        except (FishError, RuntimeError) as exc:
-            logger.exception("Не удалось воспроизвести потоковый TTS")
-            _publish(status_callback, "error", str(exc))
-            continue
-        tts_total_seconds = time.monotonic() - tts_started
-        first_voice_seconds = tts_started + first_audio_seconds - turn_started
+        _log_text(settings, "Ответ", streamed.chat.reply)
+        _publish(status_callback, "reply", streamed.chat.reply)
+        first_voice_seconds = (
+            streamed.tts_started_at + streamed.playback.first_output_seconds - turn_started
+        )
         total_seconds = time.monotonic() - turn_started
+        tts_playback_seconds = max(0.0, total_seconds - first_voice_seconds)
         first_voice_samples.append(first_voice_seconds)
         metric = (
             f"После конца речи {first_voice_seconds:.1f} с · VAD {vad_seconds:.1f} · "
             f"wake {wake_seconds:.1f} · STT {stt_seconds:.1f} · "
-            f"Luna {luna_seconds:.1f} · Fish {first_audio_seconds:.1f}"
+            f"screen {screen_seconds:.1f} · model first {streamed.model_first_text_seconds:.1f} "
+            f"/ speech {streamed.speech_ready_seconds:.1f} "
+            f"/ full {streamed.model_total_seconds:.1f} · "
+            f"Fish {streamed.playback.first_chunk_seconds:.1f}"
         )
         if len(first_voice_samples) >= 5:
-            metric += (
-                f" · p50 {_percentile(first_voice_samples, 0.5):.1f}"
-                f" / p95 {_percentile(first_voice_samples, 0.95):.1f}"
-            )
+            metric += f" · p50 {_percentile(first_voice_samples, 0.5):.1f}"
+        if len(first_voice_samples) >= 20:
+            metric += f" / p95 {_percentile(first_voice_samples, 0.95):.1f}"
         _publish(status_callback, "metrics", metric)
         logger.info(
-            "Задержка хода: vad=%.3fs wake=%.3fs stt=%.3fs screen=%.3fs luna=%.3fs "
-            "fish_first=%.3fs first_voice=%.3fs tts_playback=%.3fs total=%.3fs",
+            "Задержка хода: vad=%.3fs wake=%.3fs stt=%.3fs screen=%.3fs "
+            "model_first=%.3fs speech_ready=%.3fs model_total=%.3fs "
+            "fish_first=%.3fs audio_output=%.3fs first_voice=%.3fs "
+            "tts_playback=%.3fs total=%.3fs",
             vad_seconds,
             wake_seconds,
             stt_seconds,
             screen_seconds,
-            luna_seconds,
-            first_audio_seconds,
+            streamed.model_first_text_seconds,
+            streamed.speech_ready_seconds,
+            streamed.model_total_seconds,
+            streamed.playback.first_chunk_seconds,
+            streamed.playback.first_output_seconds,
             first_voice_seconds,
-            tts_total_seconds,
+            tts_playback_seconds,
             total_seconds,
         )
 
+    await openrouter_http.aclose()
+    await fish_http.aclose()
     logger.info("Фоновый агент остановлен")
     _publish(status_callback, "stopped", "Агент остановлен")

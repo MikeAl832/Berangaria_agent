@@ -29,8 +29,21 @@ jobs:
       - name: Ruff
         run: python -m ruff check .
 
+      - name: Compile Python sources
+        shell: pwsh
+        run: |
+          $pyFiles = rg --files -g '*.py'
+          python -m py_compile $pyFiles
+
       - name: Bandit
         run: python -m bandit -q -ll -r berangaria_agent
+
+      - name: Dependency audit
+        run: python -m pip_audit -r requirements.txt --progress-spinner off
+
+      - name: Windows launcher smoke test
+        shell: cmd
+        run: call start-agent.bat --help
 
       - name: Build package
         run: python -m build

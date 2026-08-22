@@ -32,8 +32,11 @@ def test_load_settings_reads_yaml_and_environment(tmp_path, monkeypatch):
     assert settings.port == 9000
     assert settings.history_turns == 7
     assert settings.vision_detail == "original"
-    assert settings.reasoning_effort == ""
-    assert settings.service_tier == ""
+    assert settings.reasoning_effort == "none"
+    assert settings.service_tier == "priority"
+    assert settings.provider_data_collection == "deny"
+    assert settings.provider_zdr is False
+    assert settings.chat_timeout_seconds == 60.0
     assert settings.transcription_backend == "local"
     assert settings.transcription_model == "openai/whisper-large-v3"
     assert settings.transcription_provider == "auto"
@@ -49,6 +52,9 @@ def test_load_settings_reads_yaml_and_environment(tmp_path, monkeypatch):
     assert settings.screen_max_height == 1080
     assert settings.screen_original_for_text_requests is True
     assert settings.fish_format == "wav"
+    assert settings.fish_first_audio_timeout_seconds == 5.0
+    assert settings.turn_timeout_seconds == 45.0
+    assert settings.log_content is False
     assert settings.fish_ready is False
 
 
@@ -67,12 +73,32 @@ def test_startup_missing_openrouter_has_actionable_error(settings):
         missing.validate_startup()
 
 
+def test_startup_rejects_local_hotword_bias(settings):
+    biased = replace(settings, local_transcription_hotwords="Бер Берангария")
+    with pytest.raises(ValueError, match="hotwords должен оставаться пустым"):
+        biased.validate_startup()
+
+
+def test_provider_preferences_enforce_data_policy(settings):
+    strict = replace(settings, provider_zdr=True)
+
+    assert strict.provider_preferences("openai", True) == {
+        "allow_fallbacks": True,
+        "data_collection": "deny",
+        "order": ["openai"],
+        "zdr": True,
+    }
+
+
 def test_load_settings_uses_built_in_defaults_without_config_file(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
 
     settings = load_settings(tmp_path)
 
     assert settings.model == "openai/gpt-5.6-luna"
+    assert settings.provider == "openai"
+    assert settings.service_tier == "priority"
+    assert settings.reasoning_effort == "none"
     assert settings.transcription_model == "openai/whisper-large-v3"
     assert settings.fish_format == "wav"
 
@@ -87,3 +113,25 @@ def test_load_settings_preserves_explicit_reasoning_none(tmp_path, monkeypatch):
     settings = load_settings(tmp_path)
 
     assert settings.reasoning_effort == "none"
+
+
+def test_load_settings_rejects_insecure_openrouter_url(tmp_path, monkeypatch):
+    (tmp_path / "config.yaml").write_text(
+        "openrouter_url: http://example.test/chat\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+
+    with pytest.raises(ValueError, match="HTTPS URL"):
+        load_settings(tmp_path)
+
+
+def test_load_settings_rejects_unknown_fields(tmp_path, monkeypatch):
+    (tmp_path / "config.yaml").write_text(
+        "vad_silnce_ms: 500\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+
+    with pytest.raises(ValueError, match="vad_silnce_ms"):
+        load_settings(tmp_path)

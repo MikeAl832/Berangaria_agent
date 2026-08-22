@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 import httpx
 
@@ -42,16 +43,34 @@ def speech_text(text: object, *, emotion: str, max_chars: int) -> str:
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     if max_chars > 0 and len(cleaned) > max_chars:
-        cleaned = cleaned[:max_chars].rstrip()
+        sentence_end = max(cleaned.rfind(mark, 0, max_chars + 1) for mark in ".!?…")
+        if sentence_end >= max_chars // 2:
+            cleaned = cleaned[: sentence_end + 1].rstrip()
+        else:
+            word_end = cleaned.rfind(" ", 0, max_chars + 1)
+            cleaned = cleaned[: word_end if word_end > 0 else max_chars].rstrip()
     normalized_emotion = emotion.strip().lower()
     if cleaned and normalized_emotion in _ALLOWED_EMOTIONS:
         return f"[{normalized_emotion}] {cleaned}"
     return cleaned
 
 
+@asynccontextmanager
+async def _client_scope(
+    existing: httpx.AsyncClient | None,
+    timeout: float | httpx.Timeout,
+) -> AsyncIterator[httpx.AsyncClient]:
+    if existing is not None:
+        yield existing
+        return
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        yield client
+
+
 class FishClient:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, client: httpx.AsyncClient | None = None) -> None:
         self.settings = settings
+        self._client = client
 
     async def synthesize(self, text: str) -> bytes:
         if not self.settings.fish_ready:
@@ -76,10 +95,15 @@ class FishClient:
             "normalize": True,
         }
         last_error = "неизвестная ошибка"
-        async with httpx.AsyncClient(timeout=self.settings.fish_timeout_seconds) as client:
+        async with _client_scope(self._client, self.settings.fish_timeout_seconds) as client:
             for attempt in range(2):
                 try:
-                    response = await client.post(API_URL, headers=headers, json=payload)
+                    response = await client.post(
+                        API_URL,
+                        headers=headers,
+                        json=payload,
+                        timeout=self.settings.fish_timeout_seconds,
+                    )
                 except httpx.RequestError as exc:
                     last_error = str(exc) or exc.__class__.__name__
                     if attempt == 0:
@@ -90,7 +114,10 @@ class FishClient:
                     if not response.content:
                         raise FishError("Fish Audio вернул пустой файл")
                     return response.content
-                last_error = f"HTTP {response.status_code}: {response.text[:200]}"
+                request_id = response.headers.get("X-Request-Id", "нет")
+                last_error = f"HTTP {response.status_code}, request={request_id}"
+                if self.settings.log_content and response.text:
+                    last_error += f": {response.text[:200]}"
                 if response.status_code not in {408, 425, 429, 500, 502, 503, 504} or attempt:
                     break
                 await asyncio.sleep(0.5)
@@ -125,12 +152,16 @@ class FishClient:
             self.settings.fish_timeout_seconds,
             read=min(4.0, self.settings.fish_timeout_seconds),
         )
-        async with httpx.AsyncClient(timeout=stream_timeout) as client:
+        async with _client_scope(self._client, stream_timeout) as client:
             for attempt in range(2):
                 received_audio = False
                 try:
                     async with client.stream(
-                        "POST", API_URL, headers=headers, json=payload
+                        "POST",
+                        API_URL,
+                        headers=headers,
+                        json=payload,
+                        timeout=stream_timeout,
                     ) as response:
                         if response.status_code == 200:
                             async for chunk in response.aiter_bytes():
@@ -140,8 +171,13 @@ class FishClient:
                             if not received_audio:
                                 raise FishError("Fish Audio вернул пустой PCM-поток")
                             return
-                        body = (await response.aread()).decode("utf-8", errors="replace")
-                        last_error = f"HTTP {response.status_code}: {body[:200]}"
+                        request_id = response.headers.get("X-Request-Id", "нет")
+                        last_error = f"HTTP {response.status_code}, request={request_id}"
+                        if self.settings.log_content:
+                            body = (await response.aread()).decode("utf-8", errors="replace")
+                            last_error += f": {body[:200]}"
+                        else:
+                            await response.aread()
                         retryable = response.status_code in {408, 425, 429, 500, 502, 503, 504}
                         if not retryable or attempt:
                             break

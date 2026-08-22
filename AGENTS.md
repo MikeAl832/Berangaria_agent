@@ -111,7 +111,7 @@ cmd.exe /d /c "call start-agent.bat --help"
 .\.venv\Scripts\python.exe -m build
 ```
 
-The established baseline is 38 passing tests. If the count changes, explain why.
+The established baseline is 52 passing tests. If the count changes, explain why.
 For audio or GPU changes, unit tests are necessary but not sufficient: perform a
 short live smoke test and inspect `berangaria-agent.log` without committing it.
 

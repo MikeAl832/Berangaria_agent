@@ -2,7 +2,7 @@ import base64
 
 import pytest
 
-from berangaria_agent.server import parse_turn
+from berangaria_agent.server import RequestHandler, parse_turn
 from berangaria_agent.service import InputError
 
 
@@ -34,3 +34,15 @@ def test_parse_turn_decodes_and_normalizes_media(settings):
 def test_parse_turn_rejects_bad_input(settings, payload, message):
     with pytest.raises(InputError, match=message):
         parse_turn(payload, settings)
+
+
+def test_http_log_redacts_session_token(caplog):
+    handler = object.__new__(RequestHandler)
+    handler.path = "/session/super-secret-token"
+    handler.command = "GET"
+    caplog.set_level("INFO", logger="berangaria_agent.server")
+
+    handler.log_message('%s %s', '"GET /session/super-secret-token HTTP/1.1"', "200")
+
+    assert "super-secret-token" not in caplog.text
+    assert "/session/<redacted>" in caplog.text

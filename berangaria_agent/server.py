@@ -108,7 +108,11 @@ class RequestHandler(BaseHTTPRequestHandler):
     server: AgentHTTPServer
 
     def log_message(self, format: str, *args: Any) -> None:
-        logger.info("desktop-agent http: " + format, *args)
+        path = urlsplit(self.path).path
+        if path.startswith("/session/"):
+            path = "/session/<redacted>"
+        status = str(args[1]) if len(args) > 1 else "unknown"
+        logger.info("desktop-agent http: method=%s path=%s status=%s", self.command, path, status)
 
     def _security_headers(self) -> None:
         self.send_header("Cache-Control", "no-store")

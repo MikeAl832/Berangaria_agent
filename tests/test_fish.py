@@ -13,6 +13,12 @@ def test_speech_text_caps_length():
     assert speech_text("123456", emotion="", max_chars=4) == "1234"
 
 
+def test_speech_text_prefers_a_complete_sentence_when_capped():
+    assert speech_text("Первая фраза. Вторая длинная фраза.", emotion="", max_chars=20) == (
+        "Первая фраза."
+    )
+
+
 def test_stream_pcm_posts_streaming_pcm_request(settings, monkeypatch):
     class Response:
         status_code = 200
@@ -38,7 +44,7 @@ def test_stream_pcm_posts_streaming_pcm_request(settings, monkeypatch):
         async def __aexit__(self, *_args):
             return False
 
-        def stream(self, method, url, *, headers, json):
+        def stream(self, method, url, *, headers, json, timeout):
             self.request = (method, url, headers, json)
             return StreamContext()
 
