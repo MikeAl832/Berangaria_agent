@@ -26,9 +26,17 @@ if not exist "%AGENT_PYTHON%" (
         set "AGENT_PYTHON=%CD%\.venv\Scripts\python.exe"
     ) else (
         where py >nul 2>nul
-        if errorlevel 1 goto :python_missing
-        py -3.11 -m venv "%CD%\.venv"
-        if errorlevel 1 goto :python_missing
+        if not errorlevel 1 (
+            py -3.11 -m venv "%CD%\.venv"
+            if errorlevel 1 goto :python_missing
+        ) else (
+            where python >nul 2>nul
+            if errorlevel 1 goto :python_missing
+            python -c "import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 11) else 1)"
+            if errorlevel 1 goto :python_missing
+            python -m venv "%CD%\.venv"
+            if errorlevel 1 goto :python_missing
+        )
         set "AGENT_PYTHON=%CD%\.venv\Scripts\python.exe"
     )
 
