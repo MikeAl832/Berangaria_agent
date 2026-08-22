@@ -32,7 +32,7 @@ jobs:
       - name: Compile Python sources
         shell: pwsh
         run: |
-          $pyFiles = rg --files -g '*.py'
+          $pyFiles = git ls-files '*.py'
           python -m py_compile $pyFiles
 
       - name: Bandit
