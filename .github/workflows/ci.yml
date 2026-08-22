@@ -44,8 +44,17 @@ jobs:
       - name: Windows launcher smoke test
         shell: pwsh
         run: |
-          $env:BERANGARIA_AGENT_PYTHON = (Get-Command python).Source
-          cmd.exe /d /c "call start-agent.bat --help"
+          $env:BERANGARIA_AGENT_PYTHON = python -c "import sys; print(sys.executable)"
+          $env:PYTHONUTF8 = "1"
+          $launcherOutput = cmd.exe /d /c "call start-agent.bat --help" 2>&1
+          $launcherExit = $LASTEXITCODE
+          $launcherOutput | Write-Output
+          if ($launcherExit -ne 0) {
+            $tail = ($launcherOutput | Select-Object -Last 30) -join "`n"
+            $tail = $tail.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
+            Write-Output "::error title=Launcher smoke failed::$tail"
+            exit $launcherExit
+          }
 
       - name: Build package
         run: python -m build
