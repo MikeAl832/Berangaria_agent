@@ -42,8 +42,10 @@ jobs:
         run: python -m pip_audit -r requirements.txt --progress-spinner off
 
       - name: Windows launcher smoke test
-        shell: cmd
-        run: call start-agent.bat --help
+        shell: pwsh
+        run: |
+          $env:BERANGARIA_AGENT_PYTHON = (Get-Command python).Source
+          cmd.exe /d /c "call start-agent.bat --help"
 
       - name: Build package
         run: python -m build
